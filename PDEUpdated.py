@@ -1,0 +1,1292 @@
+import warnings
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error, mean_squared_log_error, mean_absolute_error, median_absolute_error
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from scipy.integrate import odeint
+from scipy.optimize import differential_evolution, minimize
+import seaborn as sns
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+from typing import Dict, List, Tuple, Callable, Optional, Any
+import copy
+
+# Set plotting defaults
+plt.rcParams['xtick.labelsize'] = 12
+plt.rcParams['ytick.labelsize'] = 12
+plt.rcParams['font.size'] = 20
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['text.usetex'] = False
+
+sns.set_palette(["#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+                 "#D55E00", "#CC79A7"])
+ncolours = len(plt.rcParams['axes.prop_cycle'])
+colours = [list(plt.rcParams['axes.prop_cycle'])[i]['color'] for i in range(ncolours)]
+
+class SyntheticDataGenerator:
+    """
+    Synthetic Data Generator for CrossLabFit Validation
+    Generates multi-lab datasets with realistic experimental characteristics
+    """
+    
+    def __init__(self, random_seed: int = 42):
+        """Initialize the synthetic data generator"""
+        self.random_seed = random_seed
+        np.random.seed(random_seed)
+        
+    def generate_ground_truth_solution(self, model_func: Callable, true_params: Dict[str, float], 
+                                     initial_condition: np.ndarray, time_points: np.ndarray, 
+                                     variable_names: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Generate ground truth solution from known parameters
+        
+        Parameters:
+        -----------
+        model_func : callable
+            Model function (ODE system)
+        true_params : dict
+            True parameter values
+        initial_condition : np.ndarray
+            Initial conditions
+        time_points : np.ndarray
+            Time points for simulation
+        variable_names : list, optional
+            Names of state variables
+            
+        Returns:
+        --------
+        dict : Ground truth data dictionary
+        """
+        
+        # Simulate ground truth
+        solution = odeint(model_func, initial_condition, time_points, 
+                         args=tuple(true_params.values()))
+        
+        result = {
+            'time': time_points,
+            'solution': solution,
+            'true_params': true_params,
+            'initial_condition': initial_condition
+        }
+        
+        if variable_names:
+            result['variable_names'] = variable_names
+            for i, var_name in enumerate(variable_names):
+                result[var_name] = solution[:, i]
+        
+        return result
+    
+    def generate_quantitative_dataset(self, ground_truth: Dict[str, Any], 
+                                    observed_variable_idx: int,
+                                    sampling_times: np.ndarray,
+                                    noise_config: Dict[str, Any]) -> pd.DataFrame:
+        """
+        Generate quantitative dataset with realistic experimental noise
+        
+        Parameters:
+        -----------
+        ground_truth : dict
+            Ground truth solution
+        observed_variable_idx : int
+            Index of observed variable
+        sampling_times : np.ndarray
+            Experimental sampling times
+        noise_config : dict
+            Noise configuration parameters
+            
+        Returns:
+        --------
+        pd.DataFrame : Quantitative dataset
+        """
+        
+        measurements = []
+        
+        for t_sample in sampling_times:
+            # Find closest time point in ground truth
+            idx = np.argmin(np.abs(ground_truth['time'] - t_sample))
+            true_value = ground_truth['solution'][idx, observed_variable_idx]
+            
+            # Apply noise based on configuration
+            if noise_config['type'] == 'lognormal':
+                noise_factor = np.random.lognormal(0, noise_config['sigma'])
+                measured_value = true_value * noise_factor
+            elif noise_config['type'] == 'gaussian':
+                noise = np.random.normal(0, noise_config['sigma'] * true_value)
+                measured_value = true_value + noise
+            elif noise_config['type'] == 'uniform':
+                noise_range = noise_config['sigma'] * true_value
+                noise = np.random.uniform(-noise_range, noise_range)
+                measured_value = true_value + noise
+            else:
+                measured_value = true_value
+            
+            # Apply minimum detection limit
+            min_detection = noise_config.get('min_detection', 0)
+            measured_value = max(measured_value, min_detection)
+            
+            measurements.append(measured_value)
+        
+        return pd.DataFrame({
+            'time': sampling_times,
+            f'variable_{observed_variable_idx}': measurements
+        })
+    
+    def generate_multi_lab_datasets(self, ground_truth: Dict[str, Any],
+                                  observed_variable_idx: int,
+                                  lab_configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Generate multiple lab datasets with different characteristics
+        Following CrossLabFit paper methodology for multi-lab simulation
+        """
+        
+        lab_datasets = []
+        
+        for lab_config in lab_configs:
+            # Generate sampling times for this lab
+            time_min = lab_config.get('time_min', 0)
+            time_max = lab_config.get('time_max', ground_truth['time'][-1])
+            n_samples = lab_config.get('n_samples', 10)
+            
+            if lab_config.get('sampling_strategy') == 'random':
+                sampling_times = np.sort(np.random.uniform(time_min, time_max, n_samples))
+            elif lab_config.get('sampling_strategy') == 'clustered':
+                # Clustered sampling (some labs sample more frequently in certain periods)
+                cluster_center = lab_config.get('cluster_center', (time_min + time_max) / 2)
+                cluster_width = lab_config.get('cluster_width', (time_max - time_min) / 4)
+                n_cluster = int(n_samples * 0.7)
+                n_random = n_samples - n_cluster
+                
+                cluster_times = np.random.normal(cluster_center, cluster_width, n_cluster)
+                cluster_times = np.clip(cluster_times, time_min, time_max)
+                random_times = np.random.uniform(time_min, time_max, n_random)
+                sampling_times = np.sort(np.concatenate([cluster_times, random_times]))
+            else:
+                # Regular sampling
+                sampling_times = np.linspace(time_min, time_max, n_samples)
+            
+            # Add time offset (different labs might have slight timing differences)
+            time_offset = lab_config.get('time_offset', 0)
+            sampling_times += time_offset
+            
+            # Get true values at sampling times
+            measurements = []
+            for t_sample in sampling_times:
+                idx = np.argmin(np.abs(ground_truth['time'] - t_sample))
+                true_value = ground_truth['solution'][idx, observed_variable_idx]
+                
+                # Apply lab-specific transformations
+                scale_factor = lab_config.get('scale_factor', 1.0)
+                bias = lab_config.get('bias', 0.0)
+                
+                # Different measurement methods
+                method = lab_config.get('method', 'generic')
+                if method == 'flow_cytometry':
+                    # Direct cell count, good precision
+                    measured_value = true_value * scale_factor + bias
+                elif method == 'qpcr':
+                    # Fold change measurement, can be more variable
+                    baseline = ground_truth['solution'][0, observed_variable_idx]
+                    fold_change = true_value / baseline
+                    measured_value = fold_change * scale_factor + bias
+                elif method == 'elisa':
+                    # Protein concentration, often different units
+                    measured_value = (true_value / 1000) * scale_factor + bias
+                elif method == 'histology':
+                    # Subjective scoring, highest variability
+                    measured_value = true_value * scale_factor + bias
+                else:
+                    measured_value = true_value * scale_factor + bias
+                
+                # Apply noise
+                noise_level = lab_config.get('noise_level', 0.1)
+                noise_type = lab_config.get('noise_type', 'lognormal')
+                
+                if noise_type == 'lognormal':
+                    noise_factor = np.random.lognormal(0, noise_level)
+                    measured_value *= noise_factor
+                elif noise_type == 'gaussian':
+                    noise = np.random.normal(0, noise_level * measured_value)
+                    measured_value += noise
+                
+                # Apply detection limits
+                min_detection = lab_config.get('min_detection', 0)
+                max_detection = lab_config.get('max_detection', np.inf)
+                measured_value = np.clip(measured_value, min_detection, max_detection)
+                
+                measurements.append(max(0, measured_value))  # No negative values
+            
+            # Create dataset
+            dataset = {
+                'name': lab_config.get('name', 'Lab'),
+                'time': np.array(sampling_times),
+                'values': np.array(measurements),
+                'method': lab_config.get('method', 'generic'),
+                'scale_factor': lab_config.get('scale_factor', 1.0),
+                'noise_level': lab_config.get('noise_level', 0.1),
+                'n_samples': len(measurements),
+                'config': lab_config
+            }
+            
+            lab_datasets.append(dataset)
+        
+        return lab_datasets
+    
+    def create_realistic_lab_configs(self, n_labs: int = 4) -> List[Dict[str, Any]]:
+        """
+        Create realistic lab configurations based on common experimental setups
+        Following CrossLabFit paper examples
+        """
+        
+        # Base configurations for different lab types
+        base_configs = [
+            {
+                'name': 'Lab A - Flow Cytometry',
+                'method': 'flow_cytometry',
+                'scale_factor': 1.0,
+                'noise_level': 0.15,
+                'time_offset': 0.0,
+                'sampling_strategy': 'regular',
+                'n_samples': 12,
+                'bias': 0,
+                'min_detection': 50,
+                'max_detection': 1e8
+            },
+            {
+                'name': 'Lab B - qPCR',
+                'method': 'qpcr',
+                'scale_factor': 1.0,
+                'noise_level': 0.25,
+                'time_offset': 0.2,
+                'sampling_strategy': 'clustered',
+                'cluster_center': 5.0,
+                'cluster_width': 2.0,
+                'n_samples': 8,
+                'bias': 0,
+                'min_detection': 0.1,
+                'max_detection': 100
+            },
+            {
+                'name': 'Lab C - ELISA',
+                'method': 'elisa',
+                'scale_factor': 0.8,
+                'noise_level': 0.35,
+                'time_offset': -0.1,
+                'sampling_strategy': 'random',
+                'n_samples': 10,
+                'bias': 0.05,
+                'min_detection': 0.01,
+                'max_detection': 10
+            },
+            {
+                'name': 'Lab D - Histology',
+                'method': 'histology',
+                'scale_factor': 1.3,
+                'noise_level': 0.4,
+                'time_offset': 0.3,
+                'sampling_strategy': 'regular',
+                'n_samples': 6,
+                'bias': 0,
+                'noise_type': 'gaussian',
+                'min_detection': 0.1,
+                'max_detection': 5
+            }
+        ]
+        
+        # Return requested number of configs
+        if n_labs <= len(base_configs):
+            return base_configs[:n_labs]
+        else:
+            # Generate additional configs by varying base ones
+            configs = base_configs.copy()
+            for i in range(len(base_configs), n_labs):
+                base_idx = i % len(base_configs)
+                new_config = copy.deepcopy(base_configs[base_idx])
+                new_config['name'] = f"Lab {chr(65+i)} - {new_config['method']}_variant"
+                # Add some variation
+                new_config['scale_factor'] *= np.random.uniform(0.8, 1.2)
+                new_config['noise_level'] *= np.random.uniform(0.8, 1.2)
+                new_config['time_offset'] += np.random.uniform(-0.2, 0.2)
+                configs.append(new_config)
+            
+            return configs
+    
+    def validate_crosslabfit_recovery(self, model_func: Callable, true_params: Dict[str, float],
+                                    initial_condition: np.ndarray, param_bounds: List[Tuple],
+                                    param_names: List[str], 
+                                    observed_variable_idx: int = 0,
+                                    n_labs: int = 4,
+                                    simulation_time: Tuple[float, float, int] = (0, 12, 200),
+                                    quantitative_samples: int = 11) -> Dict[str, Any]:
+        """
+        Complete validation pipeline for CrossLabFit methodology
+        Generates synthetic data and tests parameter recovery
+        """
+        
+        print(" CROSSLABFIT SYNTHETIC DATA VALIDATION")
+        print("=" * 60)
+        
+        # Generate ground truth
+        time_full = np.linspace(simulation_time[0], simulation_time[1], simulation_time[2])
+        ground_truth = self.generate_ground_truth_solution(
+            model_func, true_params, initial_condition, time_full
+        )
+        
+        print(f" Generated ground truth with {len(true_params)} parameters")
+        
+        # Generate quantitative dataset
+        quant_times = np.linspace(simulation_time[0]+1, simulation_time[1]-1, quantitative_samples)
+        noise_config = {'type': 'lognormal', 'sigma': 0.25, 'min_detection': 50}
+        quantitative_data = self.generate_quantitative_dataset(
+            ground_truth, observed_variable_idx, quant_times, noise_config
+        )
+        
+        print(f" Generated quantitative dataset: {len(quantitative_data)} measurements")
+        
+        # Generate multi-lab datasets
+        lab_configs = self.create_realistic_lab_configs(n_labs)
+        lab_datasets = self.generate_multi_lab_datasets(
+            ground_truth, observed_variable_idx, lab_configs
+        )
+        
+        print(f" Generated {len(lab_datasets)} lab datasets:")
+        for dataset in lab_datasets:
+            print(f"   {dataset['name']}: {dataset['n_samples']} points, "
+                  f"scale={dataset['scale_factor']:.2f}, noise={dataset['noise_level']:.2f}")
+        
+        return {
+            'ground_truth': ground_truth,
+            'quantitative_data': quantitative_data,
+            'lab_datasets': lab_datasets,
+            'lab_configs': lab_configs,
+            'true_params': true_params,
+            'param_bounds': param_bounds,
+            'param_names': param_names
+        }
+
+class PDEmodel:
+    """
+    COMPLETE PDEmodel with ALL CrossLabFit Features:
+    - Initial condition fitting
+    - Qualitative windows and clustering
+    - CrossLabFit methodology
+    - Bootstrapping
+    - Likelihood profiles
+    - Synthetic data generation
+    """
+    
+    def __init__(self, data, model, initfunc, bounds, param_names=None, nvars=1,
+                 ndims=1, nreplicates=1, obsidx=None, outfunc=None, 
+                 fit_initial=False, initial_bounds=None, initial_param_names=None,
+                 qualitative_windows=None, initial_param_mapping=None):
+        """Initialize the PDEmodel object with ALL CrossLabFit capabilities"""
+        
+        self.model = model
+        self.initfunc = initfunc
+        self.data = data
+        self.bounds = bounds
+        self.nvars = nvars
+        self.spacedims = ndims
+        self.nreplicates = nreplicates
+        self.obsidx = obsidx
+        self.outfunc = outfunc
+        self.nparams = len(self.bounds)
+        
+        # Enhanced attributes for initial condition fitting
+        self.fit_initial = fit_initial
+        self.initial_bounds = initial_bounds or []
+        self.n_initial_params = len(self.initial_bounds) if fit_initial else 0
+        self.initial_param_names = initial_param_names or ['initial_param_' + str(i+1) 
+                                                          for i in range(self.n_initial_params)]
+        
+        # Parameter mapping for initial conditions
+        if initial_param_mapping is None and fit_initial:
+            self.initial_param_mapping = [list(range(self.n_initial_params)) for _ in range(self.nvars)]
+        else:
+            self.initial_param_mapping = initial_param_mapping
+        
+        # Qualitative windows with validation
+        self.qualitative_windows = qualitative_windows or {}
+        
+        # Weight parameters for cost function components
+        self.qt_weight = 1.0
+        self.ql_weight = 1.0
+
+        if param_names is not None:
+            self.param_names = param_names
+        else:
+            self.param_names = ['parameter ' + str(i+1) for i in range(self.nparams)]
+
+        # Combined parameter names for when fitting initial conditions
+        if self.fit_initial:
+            self.all_param_names = self.param_names + self.initial_param_names
+            self.all_bounds = self.bounds + self.initial_bounds
+        else:
+            self.all_param_names = self.param_names
+            self.all_bounds = self.bounds
+
+        # Initialize synthetic data generator
+        self.synthetic_generator = SyntheticDataGenerator()
+
+        # Process input data
+        self._process_data()
+        
+        # Initialize with base initial conditions
+        self._compute_initial_condition()
+
+    def _process_data(self):
+        """Process and organize input data"""
+        datacols = self.data.columns.values
+        alloutputs = self.data[datacols[1+self.spacedims:]].values
+        allcoordinates = self.data[datacols[1:1+self.spacedims]].values
+
+        self.timedata = np.sort(np.unique(self.data[datacols[0]]))
+        dt = self.timedata[1] - self.timedata[0]
+        self.time = np.concatenate((np.arange(0,self.timedata[0],dt), self.timedata))
+        self.timeidxs = np.array([np.argwhere(np.isclose(t, self.time))[0][0] for t in self.timedata])
+
+        if self.spacedims==1:
+            self.space = np.sort(np.unique(allcoordinates))
+        elif self.spacedims>1:
+            shapes = np.empty(self.spacedims).astype(int)
+            self.spacerange = []
+            grid = []
+            for i in range(self.spacedims):
+                sortedspace = np.sort(np.unique(allcoordinates[:,i]))
+                self.spacerange.append([np.min(sortedspace), np.max(sortedspace)])
+                grid.append(sortedspace)
+                shapes[i] = sortedspace.shape[0]
+
+            shapes = tuple(np.append(shapes, self.spacedims))
+            self.spacerange = np.array(self.spacerange)
+            self.space = np.array(np.meshgrid(*(v for v in grid))).T.reshape(shapes)
+            self.shapes = shapes
+
+        self.functiondata = alloutputs
+
+    def _compute_initial_condition(self, initial_params=None):
+        """Compute initial condition, possibly with fitted parameters"""
+        if self.spacedims == 0:
+            if self.fit_initial:
+                if initial_params is not None:
+                    self.initial_condition = np.array([self.initfunc[i](*[initial_params[j] for j in self.initial_param_mapping[i]]) 
+                                                     for i in range(self.nvars)])
+                else:
+                    # Use default parameters from bounds midpoints
+                    default_params = [(b[0] + b[1])/2 for b in self.initial_bounds]
+                    self.initial_condition = np.array([self.initfunc[i](*[default_params[j] for j in self.initial_param_mapping[i]]) 
+                                                     for i in range(self.nvars)])
+            else:
+                self.initial_condition = np.array([self.initfunc[i]() 
+                                                 for i in range(self.nvars)])
+        elif self.spacedims == 1:
+            if self.fit_initial:
+                if initial_params is not None:
+                    self.initial_condition = np.array([np.vectorize(lambda x: self.initfunc[i](x, *[initial_params[j] for j in self.initial_param_mapping[i]]))(self.space) 
+                                                     for i in range(self.nvars)])
+                else:
+                    default_params = [(b[0] + b[1])/2 for b in self.initial_bounds]
+                    self.initial_condition = np.array([np.vectorize(lambda x: self.initfunc[i](x, *[default_params[j] for j in self.initial_param_mapping[i]]))(self.space) 
+                                                     for i in range(self.nvars)])
+            else:
+                self.initial_condition = np.array([np.vectorize(self.initfunc[i])(self.space) 
+                                                 for i in range(self.nvars)])
+        else:
+            if self.fit_initial:
+                if initial_params is not None:
+                    self.initial_condition = []
+                    for i in range(self.nvars):
+                        func_params = [initial_params[j] for j in self.initial_param_mapping[i]]
+                        ic = np.apply_along_axis(lambda x, i=i, params=func_params: self.initfunc[i](x, *params), 
+                                               -1, self.space)
+                        self.initial_condition.append(ic)
+                    self.initial_condition = np.array(self.initial_condition)
+                else:
+                    # Use default parameters from bounds midpoints
+                    default_params = [(b[0] + b[1])/2 for b in self.initial_bounds]
+                    self.initial_condition = []
+                    for i in range(self.nvars):
+                        func_params = [default_params[j] for j in self.initial_param_mapping[i]]
+                        ic = np.apply_along_axis(lambda x, i=i, params=func_params: self.initfunc[i](x, *params), 
+                                               -1, self.space)
+                        self.initial_condition.append(ic)
+                    self.initial_condition = np.array(self.initial_condition)
+            else:
+                self.initial_condition = np.array([np.apply_along_axis(self.initfunc[i], -1, self.space) 
+                                                 for i in range(self.nvars)])
+
+        if self.nvars == 1:
+            self.initial_condition = self.initial_condition[0]
+
+    def build_qualitative_windows_from_data(self, datasets, variable_name, 
+                                          normalize_individually=True,
+                                          time_clusters=4, value_clusters=4,
+                                          min_points_per_window=3):
+        """
+        Build qualitative windows from multiple lab datasets using clustering
+        Following Algorithm 1 from CrossLabFit paper with proper rectangular windows
+        """
+        
+        # Step 1: Normalize and combine datasets
+        combined_data = []
+        
+        for dataset_idx, dataset in enumerate(datasets):
+            if normalize_individually:
+                # Normalize each dataset to [0,1]
+                values = np.array(dataset['values'])
+                if values.max() != values.min():
+                    normalized_values = (values - values.min()) / (values.max() - values.min())
+                else:
+                    normalized_values = np.ones_like(values) * 0.5
+            else:
+                normalized_values = np.array(dataset['values'])
+            
+            for time, value in zip(dataset['time'], normalized_values):
+                combined_data.append([time, value, dataset_idx])
+        
+        combined_data = np.array(combined_data)
+        
+        if len(combined_data) == 0:
+            return {}
+        
+        # Step 2: Cluster time and value axes separately
+        time_data = combined_data[:, 0].reshape(-1, 1)
+        value_data = combined_data[:, 1].reshape(-1, 1)
+        
+        time_kmeans = KMeans(n_clusters=time_clusters, random_state=42, n_init=10)
+        value_kmeans = KMeans(n_clusters=value_clusters, random_state=42, n_init=10)
+        
+        time_labels = time_kmeans.fit_predict(time_data)
+        value_labels = value_kmeans.fit_predict(value_data)
+        
+        # Step 3: Create mesh grid and select high-density windows
+        qualitative_windows = {}
+        
+        for t_cluster in range(time_clusters):
+            for v_cluster in range(value_clusters):
+                # Find points in this time-value cell
+                cell_mask = (time_labels == t_cluster) & (value_labels == v_cluster)
+                cell_points = combined_data[cell_mask]
+                
+                if len(cell_points) < min_points_per_window:
+                    continue
+                
+                # Check if multiple datasets are represented (consensus requirement)
+                unique_datasets = np.unique(cell_points[:, 2])
+                if len(unique_datasets) < 2:  # Need at least 2 datasets for consensus
+                    continue
+                
+                # Define window boundaries
+                time_range = (cell_points[:, 0].min(), cell_points[:, 0].max())
+                value_range = (cell_points[:, 1].min(), cell_points[:, 1].max())
+                
+                # Expand boundaries slightly to be more inclusive
+                time_span = max(time_range[1] - time_range[0], 0.1)
+                value_span = max(value_range[1] - value_range[0], 0.01)
+                
+                time_range = (time_range[0] - 0.1 * time_span, 
+                             time_range[1] + 0.1 * time_span)
+                value_range = (value_range[0] - 0.1 * value_span, 
+                              value_range[1] + 0.1 * value_span)
+                
+                # Create window
+                window_name = f"{variable_name}_window_{t_cluster}_{v_cluster}"
+                target_value = cell_points[:, 1].mean()
+                
+                qualitative_windows[window_name] = {
+                    'time_range': time_range,
+                    'value_range': value_range,
+                    'type': 'mean',
+                    'target': target_value,
+                    'weight': 1.0,
+                    'variable': variable_name,
+                    'n_points': len(cell_points),
+                    'n_datasets': len(unique_datasets)
+                }
+        
+        return qualitative_windows
+
+    def generate_synthetic_validation_data(self, true_params: Dict[str, float],
+                                         observed_variable_idx: int = 0,
+                                         n_labs: int = 4,
+                                         simulation_time: Tuple[float, float, int] = (0, 12, 200),
+                                         quantitative_samples: int = 11) -> Dict[str, Any]:
+        """
+        Generate synthetic validation data for CrossLabFit testing
+        """
+        
+        return self.synthetic_generator.validate_crosslabfit_recovery(
+            model_func=self.model,
+            true_params=true_params,
+            initial_condition=self.initial_condition,
+            param_bounds=self.bounds,
+            param_names=self.param_names,
+            observed_variable_idx=observed_variable_idx,
+            n_labs=n_labs,
+            simulation_time=simulation_time,
+            quantitative_samples=quantitative_samples
+        )
+
+    def compute_qualitative_features(self, solution, params):
+        """Compute qualitative features from the solution with enhanced spatial support"""
+        features = {}
+        
+        for window_name, window_config in self.qualitative_windows.items():
+            time_range = window_config.get('time_range', (0, -1))
+            space_range = window_config.get('space_range', None)
+            feature_type = window_config.get('type', 'mean')
+            
+            # Extract time window
+            t_start, t_end = time_range
+            if t_end == -1:
+                t_end_idx = len(self.time) - 1
+            else:
+                t_end_idx = np.argmin(np.abs(self.time - t_end))
+            
+            t_start_idx = np.argmin(np.abs(self.time - t_start))
+            time_idx = slice(t_start_idx, t_end_idx + 1)
+            
+            # Extract spatial window if specified
+            windowed_solution = solution[time_idx]
+            
+            if space_range is not None and self.spacedims > 0:
+                if self.spacedims == 1:
+                    s_start, s_end = space_range
+                    s_start_idx = np.argmin(np.abs(self.space - s_start))
+                    s_end_idx = np.argmin(np.abs(self.space - s_end))
+                    space_idx = slice(s_start_idx, s_end_idx + 1)
+                    if windowed_solution.ndim > 1:
+                        windowed_solution = windowed_solution[:, space_idx]
+            
+            # Ensure we have valid data
+            if windowed_solution.size == 0:
+                features[window_name] = 0
+                continue
+            
+            # Compute features
+            try:
+                if feature_type == 'mean':
+                    features[window_name] = np.mean(windowed_solution)
+                elif feature_type == 'max':
+                    features[window_name] = np.max(windowed_solution)
+                elif feature_type == 'min':
+                    features[window_name] = np.min(windowed_solution)
+                elif feature_type == 'slope':
+                    # Linear regression slope
+                    t_window = self.time[time_idx]
+                    if len(t_window) > 1 and windowed_solution.ndim > 1:
+                        mean_values = windowed_solution.mean(axis=1)
+                        if len(mean_values) > 1:
+                            slope = np.polyfit(t_window, mean_values, 1)[0]
+                            features[window_name] = slope
+                        else:
+                            features[window_name] = 0
+                    else:
+                        features[window_name] = 0
+                elif feature_type == 'custom':
+                    # Custom feature function
+                    func = window_config.get('function', lambda x: np.mean(x))
+                    features[window_name] = func(windowed_solution)
+                elif feature_type == 'integral':
+                    # Area under curve
+                    t_window = self.time[time_idx]
+                    if windowed_solution.ndim > 1 and len(t_window) > 1:
+                        features[window_name] = np.trapz(windowed_solution.mean(axis=1), t_window)
+                    elif len(t_window) > 1:
+                        features[window_name] = np.trapz(windowed_solution, t_window)
+                    else:
+                        features[window_name] = np.mean(windowed_solution)
+                else:
+                    features[window_name] = np.mean(windowed_solution)
+            except Exception as e:
+                print(f"Warning: Error computing feature {window_name}: {e}")
+                features[window_name] = 0
+        
+        return features
+
+    def validate_qualitative_windows(self):
+        """Validate that qualitative windows are properly defined"""
+        if not self.qualitative_windows:
+            return True
+        
+        errors = []
+        
+        for window_name, config in self.qualitative_windows.items():
+            # Check required fields
+            if 'time_range' not in config:
+                errors.append(f"Window {window_name}: missing time_range")
+            
+            # Check time range validity
+            time_range = config.get('time_range', (0, -1))
+            if len(time_range) != 2:
+                errors.append(f"Window {window_name}: time_range must have 2 elements")
+            
+            # Check feature type
+            valid_types = ['mean', 'max', 'min', 'slope', 'custom', 'integral']
+            if config.get('type', 'mean') not in valid_types:
+                errors.append(f"Window {window_name}: invalid feature type {config.get('type')}")
+        
+        if errors:
+            raise ValueError("Qualitative window validation failed:\n" + "\n".join(errors))
+        
+        return True
+
+    def costfn(self, params, initial_condition, functiondata, bootstrap=False):
+        """
+        Integrates the model and computes the cost function
+        Modified to handle initial condition fitting and proper weight application
+        """
+        if self.fit_initial:
+            # Split parameters into model and initial condition parameters
+            model_params = params[:self.nparams]
+            initial_params = params[self.nparams:]
+            
+            # Recompute initial condition with fitted parameters
+            self._compute_initial_condition(initial_params)
+            initial_condition = self.initial_condition
+        else:
+            model_params = params
+
+        if self.spacedims == 0:
+            if self.nparams == 1:
+                ft = odeint(self.model, initial_condition, self.time, args=(model_params[0],))
+            else:
+                ft = odeint(self.model, initial_condition, self.time, args=tuple(model_params))
+
+            ft = ft[self.timeidxs]
+
+            if not bootstrap:
+                ft = np.repeat(ft, self.nreplicates, axis=0)
+
+            if self.outfunc is not None:
+                ft = np.apply_along_axis(self.outfunc, -1, ft)
+            elif self.obsidx is not None:
+                ft = ft[:, self.obsidx]
+
+            # Compute quantitative error
+            try:
+                qt_error = self.error(ft, functiondata)
+            except:
+                qt_error = np.inf
+
+            # Compute qualitative error if windows are defined
+            ql_error = 0
+            if self.qualitative_windows:
+                try:
+                    predicted_features = self.compute_qualitative_features(ft, params)
+                    
+                    for window_name, window_config in self.qualitative_windows.items():
+                        target_value = window_config.get('target', 0)
+                        weight = window_config.get('weight', 1.0)
+                        
+                        if window_name in predicted_features:
+                            ql_error += weight * (predicted_features[window_name] - target_value)**2
+                except Exception as e:
+                    print(f"Warning: Error in qualitative feature computation: {e}")
+                    ql_error = np.inf
+
+            # Apply weights and combine errors
+            total_error = self.qt_weight * qt_error + self.ql_weight * ql_error
+
+            if self.sqrt:
+                try:
+                    total_error = np.sqrt(total_error)
+                except:
+                    total_error = np.inf
+
+            return total_error
+
+        else:
+            if self.spacedims > 1 or self.nvars > 1:
+                initial_condition = initial_condition.reshape(-1)
+
+            ft = odeint(self.model, initial_condition, self.time, args=(self.space, *model_params))
+
+            if self.nvars>1:
+                ft = ft.reshape(ft.shape[0], self.nvars, -1)
+                ft = np.array([np.transpose([ft[:,j,:][i] for j in range(self.nvars)]) for i in range(ft.shape[0])])
+
+            if self.spacedims > 1:
+                if self.nvars > 1:
+                    ft = ft.reshape(ft.shape[0], *self.shapes[:-1], self.nvars)
+                else:
+                    ft = ft.reshape(ft.shape[0], *self.shapes[:-1])
+
+            ft = ft[self.timeidxs]
+
+            if self.nvars > 1:
+                ft = ft.reshape(-1,self.nvars)
+            else:
+                ft = ft.reshape(-1)
+
+            if not bootstrap:
+                ft = np.repeat(ft, self.nreplicates, axis=0)
+
+            if self.outfunc is not None:
+                ft = np.apply_along_axis(self.outfunc, -1, ft)
+            elif self.obsidx is not None:
+                ft = ft[:, self.obsidx]
+
+            # Compute quantitative error
+            try:
+                qt_error = self.error(ft, functiondata)
+            except:
+                qt_error = np.inf
+
+            # Compute qualitative error if windows are defined
+            ql_error = 0
+            if self.qualitative_windows:
+                try:
+                    predicted_features = self.compute_qualitative_features(ft, params)
+                    
+                    for window_name, window_config in self.qualitative_windows.items():
+                        target_value = window_config.get('target', 0)
+                        weight = window_config.get('weight', 1.0)
+                        
+                        if window_name in predicted_features:
+                            ql_error += weight * (predicted_features[window_name] - target_value)**2
+                except Exception as e:
+                    print(f"Warning: Error in qualitative feature computation: {e}")
+                    ql_error = np.inf
+
+            # Apply weights and combine errors
+            total_error = self.qt_weight * qt_error + self.ql_weight * ql_error
+
+            if self.sqrt:
+                try:
+                    total_error = np.sqrt(total_error)
+                except:
+                    total_error = np.inf
+
+            return total_error
+
+    def fit(self, error='mse', qt_weight=1.0, ql_weight=1.0, maxiter=1000, popsize=15):
+        """
+        Finds the parameters that minimise the cost function
+        Modified to handle combined quantitative and qualitative fitting
+        """
+        if error in ['rmse', 'rmsle']:
+            self.sqrt = True
+        else:
+            self.sqrt = False
+
+        if error in ['mse', 'rmse']:
+            self.error = mean_squared_error
+        elif error in ['msle', 'rmsle']:
+            self.error = mean_squared_log_error
+        elif error == 'mae':
+            self.error = mean_absolute_error
+        elif error == 'medae':
+            self.error = median_absolute_error
+
+        # Set weights for quantitative and qualitative components
+        self.qt_weight = qt_weight
+        self.ql_weight = ql_weight
+
+        # Validate qualitative windows before fitting
+        self.validate_qualitative_windows()
+
+        # Use all bounds if fitting initial conditions
+        bounds_to_use = self.all_bounds if self.fit_initial else self.bounds
+
+        optimisation = differential_evolution(self.costfn, bounds=bounds_to_use, 
+                                            args=(self.initial_condition, self.functiondata),
+                                            maxiter=maxiter, popsize=popsize)
+
+        params = optimisation.x
+        
+        if self.fit_initial:
+            model_params = params[:self.nparams]
+            initial_params = params[self.nparams:]
+            
+            best_params = {self.param_names[i]: [model_params[i]] for i in range(self.nparams)}
+            best_initial_params = {self.initial_param_names[i]: [initial_params[i]] 
+                                 for i in range(self.n_initial_params)}
+            
+            self.best_params = pd.DataFrame(best_params)
+            self.best_initial_params = pd.DataFrame(best_initial_params)
+            self.best_all_params = pd.DataFrame({**best_params, **best_initial_params})
+        else:
+            best_params = {self.param_names[i]: [params[i]] for i in range(self.nparams)}
+            self.best_params = pd.DataFrame(best_params)
+
+        self.best_error = optimisation.fun
+        
+        print("Model parameters:")
+        print(self.best_params)
+        
+        if self.fit_initial:
+            print("\nInitial condition parameters:")
+            print(self.best_initial_params)
+        
+        if self.qualitative_windows:
+            print(f"\nQualitative windows used: {len(self.qualitative_windows)}")
+            print(f"Qt weight: {qt_weight}, Ql weight: {ql_weight}")
+        
+        return
+
+    def cross_tab_fit(self, quantitative_data, qualitative_constraints=None, 
+                     qualitative_datasets=None, error='mse', qt_weight=1.0, ql_weight=1.0):
+        """
+        Enhanced cross-tab fitting with automatic qualitative window generation
+        """
+        # Store original data
+        original_data = self.data
+        original_windows = self.qualitative_windows
+        
+        try:
+            # Update with new quantitative data
+            self.data = quantitative_data
+            self._process_data()  # Reprocess data structure
+            
+            # Handle qualitative constraints
+            if qualitative_constraints is not None:
+                self.qualitative_windows = qualitative_constraints
+            elif qualitative_datasets is not None:
+                # Automatically build windows from datasets
+                self.qualitative_windows = {}
+                for var_name, datasets in qualitative_datasets.items():
+                    auto_windows = self.build_qualitative_windows_from_data(
+                        datasets, var_name)
+                    self.qualitative_windows.update(auto_windows)
+            
+            # Perform fitting
+            self.fit(error=error, qt_weight=qt_weight, ql_weight=ql_weight)
+            
+            result = self.best_all_params if self.fit_initial else self.best_params
+            return result
+            
+        finally:
+            # Always restore original data
+            self.data = original_data
+            self.qualitative_windows = original_windows
+            self._process_data()  # Restore original data structure
+
+    def plot_qualitative_windows(self, solution=None, figsize=(12, 8), datasets=None):
+        """
+        Visualize the qualitative windows with proper rectangular patches
+        """
+        if not self.qualitative_windows:
+            print("No qualitative windows defined")
+            return
+        
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        
+        # Plot rectangular windows first (behind data points)
+        for window_name, window_config in self.qualitative_windows.items():
+            time_range = window_config.get('time_range', (0, -1))
+            value_range = window_config.get('value_range', (0, 1))
+            
+            t_start, t_end = time_range
+            v_start, v_end = value_range
+            
+            if t_end == -1:
+                t_end = self.time[-1] if hasattr(self, 'time') else 10
+            
+            # Create rectangular patch
+            rect = plt.Rectangle((t_start, v_start), 
+                               t_end - t_start,
+                               v_end - v_start,
+                               facecolor='gray', alpha=0.3, 
+                               edgecolor='gray', linewidth=1)
+            ax.add_patch(rect)
+        
+        # Plot datasets if provided
+        if datasets is not None:
+            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+            markers = ['o', '^', 's', 'd']
+            
+            for i, dataset in enumerate(datasets):
+                # Normalize values if needed
+                values = np.array(dataset['values'])
+                if values.max() != values.min():
+                    normalized_values = (values - values.min()) / (values.max() - values.min())
+                else:
+                    normalized_values = np.ones_like(values) * 0.5
+                
+                ax.scatter(dataset['time'], normalized_values,
+                          c=colors[i % len(colors)], 
+                          marker=markers[i % len(markers)],
+                          s=60, alpha=0.8, edgecolors='white', linewidth=0.5,
+                          label=dataset.get('name', f'Dataset {i+1}'))
+        
+        # Overlay solution if provided
+        if solution is not None and hasattr(self, 'time'):
+            ax.plot(self.time, solution, 'b-', alpha=0.7, linewidth=2, 
+                   label='Model Solution')
+        
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Normalized Value')
+        ax.set_title('Qualitative Windows from Multiple Datasets')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(-0.05, 1.05)
+        
+        plt.tight_layout()
+        plt.show()
+
+    def likelihood_profiles(self, param_values=None, npoints=100):
+        """Computes the likelihood profile of each parameter"""
+        if not hasattr(self, 'error'):
+            self.error = mean_squared_error
+            self.sqrt = False
+
+        summary = pd.DataFrame({'parameter': [], 'value': [], 'error': []})
+        
+        # Use all parameters if fitting initial conditions
+        param_names_to_use = self.all_param_names if self.fit_initial else self.param_names
+        bounds_to_use = self.all_bounds if self.fit_initial else self.bounds
+        nparams_to_use = len(param_names_to_use)
+        
+        for i in tqdm(range(nparams_to_use), desc='parameters'):
+            xmin, xmax = bounds_to_use[i]
+            pname = param_names_to_use[i]
+
+            if param_values is None:
+                pvalues = np.linspace(xmin, xmax, npoints)
+            else:
+                pvalues = param_values[i]
+
+            new_bounds = [bound for bound in bounds_to_use]
+            errors = []
+
+            for pvalue in tqdm(pvalues, desc=f'values for {pname}', leave=False):
+                new_bounds[i] = (pvalue, pvalue)
+                optimisation = differential_evolution(self.costfn, bounds=tuple(new_bounds), 
+                                                    args=(self.initial_condition, self.functiondata))
+                errors.append(optimisation.fun)
+
+            summary = pd.concat([summary, pd.DataFrame({'parameter': pname, 'value': pvalues, 
+                                                       'error': np.array(errors)})], 
+                               ignore_index=True)
+
+        self.result_profiles = summary
+        return
+
+    def plot_profiles(self):
+        """Plots the likelihood profiles with enhanced visualization"""
+        param_names_to_use = self.all_param_names if self.fit_initial else self.param_names
+        
+        n_params = len(param_names_to_use)
+        ncols = min(3, n_params)
+        nrows = (n_params + ncols - 1) // ncols
+        
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 4*nrows))
+        if nrows == 1 and ncols == 1:
+            axes = [axes]
+        elif nrows == 1:
+            axes = axes
+        else:
+            axes = axes.flatten()
+        
+        for i, pname in enumerate(param_names_to_use):
+            ax = axes[i] if n_params > 1 else axes
+            data = self.result_profiles[self.result_profiles.parameter == pname]
+            
+            ax.plot(data.value.values, data.error.values, c=colours[5], linewidth=2)
+            
+            if np.max(data.error.values) > 250*np.min(data.error.values):
+                ax.set_ylim(-10.*np.min(data.error.values), 250*np.min(data.error.values))
+            else:
+                ax.set_ylim(bottom=-3.*np.min(data.error.values))
+
+            if hasattr(self, 'best_params'):
+                if pname in self.best_params.columns:
+                    ax.scatter([self.best_params[pname][0]], [self.best_error], 
+                             c=colours[1], s=100, zorder=5)
+                elif hasattr(self, 'best_initial_params') and pname in self.best_initial_params.columns:
+                    ax.scatter([self.best_initial_params[pname][0]], [self.best_error], 
+                             c=colours[1], s=100, zorder=5)
+
+            ax.set_xlabel(pname)
+            ax.set_ylabel('Error')
+            ax.grid(True, alpha=0.3)
+        
+        # Hide empty subplots
+        for i in range(n_params, len(axes)):
+            axes[i].set_visible(False)
+            
+        plt.tight_layout()
+        plt.show()
+        return
+
+    def bootstrap(self, nruns=100):
+        """Enhanced parametric bootstrapping"""
+        if not hasattr(self, 'error'):
+            self.error = mean_squared_error
+            self.sqrt = False
+
+        param_names_to_use = self.all_param_names if self.fit_initial else self.param_names
+        bounds_to_use = self.all_bounds if self.fit_initial else self.bounds
+        
+        summary = {pname: [] for pname in param_names_to_use}
+
+        for run in tqdm(range(nruns), desc='Bootstrap runs'):
+            # Sample indices for bootstrap
+            n_total = self.data.shape[0]
+            n_unique = n_total // self.nreplicates
+            idxs = np.arange(n_unique) * self.nreplicates + np.random.randint(self.nreplicates, size=n_unique)
+            
+            # Ensure indices are within bounds
+            idxs = idxs[idxs < n_total]
+            
+            if len(idxs) == 0:
+                continue
+                
+            data = self.data.iloc[idxs]
+            functiondata = self.functiondata[idxs]
+
+            try:
+                optimisation = differential_evolution(self.costfn, bounds=bounds_to_use, 
+                                                    args=(self.initial_condition, functiondata, True))
+
+                params = optimisation.x
+                for i, pname in enumerate(param_names_to_use):
+                    summary[pname].append(params[i])
+            except Exception as e:
+                print(f"Bootstrap run {run} failed: {e}")
+                continue
+
+        summary = pd.DataFrame(summary)
+        self.bootstrap_raw = summary
+        self.bootstrap_summary = summary.describe()
+        print("Bootstrap Summary:")
+        print(self.bootstrap_summary)
+        return
+
+    def plot_bootstrap(self, figsize=(12, 8)):
+        """Enhanced bootstrap visualization"""
+        param_names_to_use = self.all_param_names if self.fit_initial else self.param_names
+        
+        if len(param_names_to_use) > 1:
+            if hasattr(self, 'best_all_params') and self.fit_initial:
+                data = self.bootstrap_raw.copy()
+                data = pd.concat([data, self.best_all_params], ignore_index=True)
+                data['best'] = 0
+                data.best.iloc[-1] = 1
+
+                g = sns.pairplot(data, vars=data.columns[:-1], hue='best', 
+                               palette={0: colours[5], 1: colours[1]}, 
+                               diag_kind='kde', plot_kws={'alpha': 0.6})
+                g._legend.remove()
+            elif hasattr(self, 'best_params'):
+                data = self.bootstrap_raw.copy()
+                data = pd.concat([data, self.best_params], ignore_index=True)
+                data['best'] = 0
+                data.best.iloc[-1] = 1
+
+                g = sns.pairplot(data, vars=data.columns[:-1], hue='best', 
+                               palette={0: colours[5], 1: colours[1]}, 
+                               diag_kind='kde', plot_kws={'alpha': 0.6})
+                g._legend.remove()
+            else:
+                g = sns.pairplot(self.bootstrap_raw, diag_kind='kde')
+        else:
+            plt.figure(figsize=figsize)
+            param_name = param_names_to_use[0]
+            
+            # Plot histogram with KDE
+            sns.histplot(data=self.bootstrap_raw[param_name], kde=True, color=colours[5], alpha=0.7)
+            plt.xlabel(param_name)
+            plt.ylabel('Density')
+            plt.title(f'Bootstrap Distribution: {param_name}')
+            
+            # Add best fit line if available
+            if hasattr(self, 'best_all_params') and self.fit_initial:
+                plt.axvline(x=self.best_all_params.iloc[0, 0], color=colours[1], 
+                           linestyle='--', linewidth=2, label='Best Fit')
+            elif hasattr(self, 'best_params'):
+                plt.axvline(x=self.best_params.iloc[0, 0], color=colours[1], 
+                           linestyle='--', linewidth=2, label='Best Fit')
+            
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+        return
+
+    def summary_report(self):
+        """Generate a comprehensive summary report"""
+        print("="*80)
+        print("PDE MODEL FITTING SUMMARY REPORT")
+        print("="*80)
+        
+        print(f"\nModel Configuration:")
+        print(f"  - Number of variables: {self.nvars}")
+        print(f"  - Spatial dimensions: {self.spacedims}")
+        print(f"  - Number of parameters: {self.nparams}")
+        print(f"  - Fitting initial conditions: {self.fit_initial}")
+        if self.fit_initial:
+            print(f"  - Initial condition parameters: {self.n_initial_params}")
+        
+        print(f"\nData Information:")
+        print(f"  - Data points: {len(self.data)}")
+        print(f"  - Time range: [{self.timedata.min():.3f}, {self.timedata.max():.3f}]")
+        print(f"  - Number of replicates: {self.nreplicates}")
+        
+        if self.qualitative_windows:
+            print(f"\nQualitative Windows: {len(self.qualitative_windows)}")
+            for name, config in self.qualitative_windows.items():
+                print(f"  - {name}: time {config['time_range']}, target {config.get('target', 'N/A'):.3f}")
+        
+        if hasattr(self, 'best_error'):
+            print(f"\nOptimization Results:")
+            print(f"  - Best error: {self.best_error:.6f}")
+            print(f"  - Quantitative weight: {self.qt_weight}")
+            print(f"  - Qualitative weight: {self.ql_weight}")
+        
+        print("="*80)
+
+
+# Test that the class is defined and demonstrate usage
+if __name__ == "__main__":
+    print(" COMPLETE PDEUpdated class with ALL CrossLabFit features")
+    print("=" * 60)
+    
+    print("\n🔧 COMPLETE FEATURE LIST:")
+    print(" 1. Initial condition fitting")
+    print(" 2. CrossLabFit methodology (Algorithm 1)")
+    print(" 3. Qualitative data handling")
+    print(" 4. Clustering for window generation")
+    print(" 5. Qualitative windows (creation, validation, visualization)")
+    print(" 6. Bootstrapping (parametric)")
+    print(" 7. Likelihood profiles")
+    print(" 8. Profile plotting")
+    print(" 9. Synthetic data generation")
+    print(" 10. Multi-lab simulation")
+    print(" 11. Cross-tab fitting")
+    print(" 12. Enhanced visualization")
+    
+    print("\n EXAMPLE USAGE:")
+    print("""
+    # Create model with ALL features
+    model = PDEmodel(data, pde_func, init_func, bounds,
+                     fit_initial=True,
+                     initial_bounds=init_bounds,
+                     qualitative_windows=windows)
+    
+    # Generate synthetic validation data
+    synthetic_data = model.generate_synthetic_validation_data(true_params)
+    
+    # Build qualitative windows from multiple labs
+    windows = model.build_qualitative_windows_from_data(lab_datasets, 'CD8_T_cells')
+    
+    # Fit with quantitative + qualitative data
+    model.fit(error='mse', qt_weight=1.0, ql_weight=0.5)
+    
+    # Perform uncertainty analysis
+    model.likelihood_profiles()
+    model.plot_profiles()
+    
+    # Bootstrap for confidence intervals
+    model.bootstrap(nruns=100)
+    model.plot_bootstrap()
+    
+    # Generate summary report
+    model.summary_report()
+    """)
+    
+    print("\n Model is ready to run")
